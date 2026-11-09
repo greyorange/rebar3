@@ -1,6 +1,8 @@
 # Rebar3
 
-[![Build Status](https://github.com/erlang/rebar3/workflows/Common%20Test/badge.svg)](https://github.com/erlang/rebar3/actions?query=branch%3Amaster+workflow%3A"Common+Test") [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-22.0%20to%2024.0-blue)](http://www.erlang.org)
+[![Build Status](https://github.com/erlang/rebar3/workflows/Common%20Test/badge.svg)](https://github.com/erlang/rebar3/actions)
+[![License](https://img.shields.io/github/license/erlang/rebar3)](https://github.com/erlang/rebar3/blob/main/LICENSE)
+[![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-26.0%20to%2028.0-blue)](http://www.erlang.org)
 
 1. [What is Rebar3?](#what-is-rebar3)
 2. [Why Rebar3?](#why-rebar3)
@@ -53,6 +55,29 @@ best experience you can get.
 
 ## Getting Started
 
+### Compatibility between Rebar3 and Erlang/OTP
+
+This list presents the known working version combos between Rebar3 and
+Erlang/OTP. Always use the latest version your project can tolerate for latest
+security fixes.
+
+| Rebar3 | Erlang/OTP Support Range | Notes
+|-       |-      | -
+| 3.28.0 | 27-29 | Use 3.28.0 for a safe version. Multiple CVEs fixed starting with 3.27.x
+| 3.25.1 | 26-28 | issues with newer Windows versions were reported on 3.25.0 and OTP-28
+| 3.24.0 | 25-27 |
+| 3.23.0 | 25-27 |
+| 3.22.1 | 25-27 |
+| 3.21.0 | 24-26 |
+| 3.20.0 | 23-25 |
+| 3.19.0 | 23-25 |
+| 3.18.0 | 22-24 |
+| 3.17.0 | 22-24 |
+| 3.16.1 | 22-24 | Don't use 3.16.0, see https://ferd.ca/you-ve-got-to-upgrade-rebar3.html
+| 3.15.2 | 19-23 | Don't use 3.15.0 or 3.15.1, see https://ferd.ca/you-ve-got-to-upgrade-rebar3.html
+| 3.14.1 | 19-23 |
+| 3.13.3 | 19-22 | Don't use 3.13.1 or 3.13.2, see https://ferd.ca/you-ve-got-to-upgrade-rebar3.html
+
 A [getting started guide is maintained on the official documentation website](https://rebar3.org/docs/getting-started),
 but installing rebar3 can be done by any of the ways described below
 
@@ -94,7 +119,7 @@ by [Erlang Solutions](https://www.erlang-solutions.com/resources/download.html),
 but be sure to choose the "Standard" download option or you'll have issues building
 projects.
 
-Do note that if you are planning to work with multiple Erlang versions on the same machine, you will want to build Rebar3 with the oldest one of them. The 3 newest major Erlang releases are supported at any given time: if the newest version is OTP-24, building with versions as old as OTP-22 will be supported, and produce an executable that will work with those that follow.
+Do note that if you are planning to work with multiple Erlang versions on the same machine, you will want to build Rebar3 with the oldest one of them. The 3 newest major Erlang releases are supported at any given time: if the newest version is OTP-27, building with versions as old as OTP-25 will be supported, and produce an executable that will work with those that follow.
 
 ## Documentation
 
@@ -167,4 +192,3 @@ General rebar community resources and links can be found at
 [rebar3.org/docs/about/about-us/#community](https://rebar3.org/docs/about/about-us/#community)
 
 To contribute to rebar3, please refer to [CONTRIBUTING](CONTRIBUTING.md).
-

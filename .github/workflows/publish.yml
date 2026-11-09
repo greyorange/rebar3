@@ -5,47 +5,65 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Create release and publish escript for every new tag
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
-    - uses: actions/checkout@v2
-
-    - uses: erlef/setup-beam@v1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-          otp-version: '22.3.4.9'
+        persist-credentials: false
+
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      with:
+          otp-version: '27'
     - name: Compile
       run: ./bootstrap
     - name: CT tests
       run: ./rebar3 ct
 
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Attest Build Provenance
+      id: attest
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
       with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        draft: false
-        prerelease: false
+        subject-path: ./rebar3
 
-    - name: Upload Release Asset
-      id: upload-release-asset
-      uses: actions/upload-release-asset@v1
+    - name: Copy Attestation Bundle
+      run: cp "${ATTESTATION}" rebar3.sigstore
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./rebar3
-        asset_name: rebar3
-        asset_content_type: application/octet-stream
+        ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+
+    - name: Create Release
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        gh release create \
+          --repo "${GITHUB_REPOSITORY}" \
+          --title "${GITHUB_REF_NAME}" \
+          --generate-notes \
+          "${GITHUB_REF_NAME}"
+
+    - name: Upload Release Assets
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload --clobber "${GITHUB_REF_NAME}" \
+          --repo "${GITHUB_REPOSITORY}" \
+          rebar3 \
+          rebar3.sigstore
 
     - name: Configure AWS credentials
       if: "!github.event.release.prerelease"
-      uses: aws-actions/configure-aws-credentials@v1
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

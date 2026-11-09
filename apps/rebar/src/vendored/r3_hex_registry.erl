@@ -1,0 +1,249 @@
+%% Vendored from hex_core v0.20.1, do not edit manually
+
+%% @doc
+%% Functions for encoding and decoding Hex registries.
+-module(r3_hex_registry).
+-export([
+    encode_names/1,
+    decode_names/2,
+    build_names/2,
+    unpack_names/3,
+    encode_versions/1,
+    decode_versions/2,
+    build_versions/2,
+    unpack_versions/3,
+    encode_package/1,
+    decode_package/3,
+    build_package/2,
+    unpack_package/4,
+    encode_policy/1,
+    decode_policy/3,
+    build_policy/2,
+    unpack_policy/4,
+    sign_protobuf/2,
+    gunzip/2,
+    decode_signed/1,
+    decode_and_verify_signed/2,
+    sign/2,
+    verify/3
+]).
+-include_lib("public_key/include/public_key.hrl").
+
+-type private_key() :: #'RSAPrivateKey'{} | binary().
+-type public_key() :: #'RSAPublicKey'{} | binary().
+
+%%====================================================================
+%% API functions
+%%====================================================================
+
+%% @doc
+%% Builds names resource.
+build_names(Names, PrivateKey) ->
+    Payload = encode_names(Names),
+    zlib:gzip(sign_protobuf(Payload, PrivateKey)).
+
+%% @doc
+%% Unpacks names resource.
+unpack_names(Payload, Repository, PublicKey) ->
+    case gunzip_and_verify(Payload, PublicKey) of
+        {ok, Names} -> decode_names(Names, Repository);
+        Other -> Other
+    end.
+
+%% @private
+encode_names(Names) ->
+    r3_hex_pb_names:encode_msg(Names, 'Names').
+
+%% @private
+decode_names(Payload, no_verify) ->
+    {ok, r3_hex_pb_names:decode_msg(Payload, 'Names')};
+decode_names(Payload, Repository) ->
+    case r3_hex_pb_names:decode_msg(Payload, 'Names') of
+        #{repository := Repository, packages := _Packages} = Result ->
+            {ok, Result};
+        _ ->
+            {error, bad_repo_name}
+    end.
+
+%% @doc
+%% Builds versions resource.
+build_versions(Versions, PrivateKey) ->
+    Payload = encode_versions(Versions),
+    zlib:gzip(sign_protobuf(Payload, PrivateKey)).
+
+%% @doc
+%% Unpacks versions resource.
+unpack_versions(Payload, Repository, PublicKey) ->
+    case gunzip_and_verify(Payload, PublicKey) of
+        {ok, Versions} -> decode_versions(Versions, Repository);
+        Other -> Other
+    end.
+
+%% @private
+encode_versions(Versions) ->
+    r3_hex_pb_versions:encode_msg(Versions, 'Versions').
+
+%% @private
+decode_versions(Payload, no_verify) ->
+    {ok, r3_hex_pb_versions:decode_msg(Payload, 'Versions')};
+decode_versions(Payload, Repository) ->
+    case r3_hex_pb_versions:decode_msg(Payload, 'Versions') of
+        #{repository := Repository, packages := _Packages} = Result ->
+            {ok, Result};
+        _ ->
+            {error, bad_repo_name}
+    end.
+
+%% @doc
+%% Builds package resource.
+build_package(Package, PrivateKey) ->
+    Payload = encode_package(Package),
+    zlib:gzip(sign_protobuf(Payload, PrivateKey)).
+
+%% @doc
+%% Unpacks package resource.
+unpack_package(Payload, Repository, Name, PublicKey) ->
+    case gunzip_and_verify(Payload, PublicKey) of
+        {ok, Package} -> decode_package(Package, Repository, Name);
+        Other -> Other
+    end.
+
+%% @private
+encode_package(Package) ->
+    r3_hex_pb_package:encode_msg(Package, 'Package').
+
+%% @private
+decode_package(Payload, no_verify, no_verify) ->
+    {ok, r3_hex_pb_package:decode_msg(Payload, 'Package')};
+decode_package(Payload, Repository, Package) ->
+    case r3_hex_pb_package:decode_msg(Payload, 'Package') of
+        #{repository := Repository, name := Package, releases := _Releases} = Result ->
+            {ok, Result};
+        _ ->
+            {error, bad_repo_name}
+    end.
+
+%% @doc
+%% Builds policy resource.
+build_policy(Policy, PrivateKey) ->
+    Payload = encode_policy(Policy),
+    zlib:gzip(sign_protobuf(Payload, PrivateKey)).
+
+%% @doc
+%% Unpacks policy resource.
+unpack_policy(Payload, Repository, Name, PublicKey) ->
+    case gunzip_and_verify(Payload, PublicKey) of
+        {ok, Policy} -> decode_policy(Policy, Repository, Name);
+        Other -> Other
+    end.
+
+%% @private
+encode_policy(Policy) ->
+    r3_hex_pb_policy:encode_msg(Policy, 'Policy').
+
+%% @private
+decode_policy(Payload, no_verify, no_verify) ->
+    {ok, r3_hex_pb_policy:decode_msg(Payload, 'Policy')};
+decode_policy(Payload, Repository, Name) ->
+    case r3_hex_pb_policy:decode_msg(Payload, 'Policy') of
+        #{repository := Repository, name := Name} = Result ->
+            {ok, Result};
+        _ ->
+            {error, bad_repo_name}
+    end.
+
+%% @private
+sign_protobuf(Payload, PrivateKey) ->
+    Signature = sign(Payload, PrivateKey),
+    r3_hex_pb_signed:encode_msg(#{payload => Payload, signature => Signature}, 'Signed').
+
+%% @private
+%% Decompresses a gzipped registry resource, stopping as soon as the output
+%% exceeds `MaxSize' bytes. Registry resources are decompressed before their
+%% signature is verified, so the limit applies to unauthenticated data.
+-spec gunzip(binary(), pos_integer() | infinity) ->
+    {ok, binary()} | {error, {too_big_uncompressed, pos_integer()}}.
+gunzip(Compressed, MaxSize) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, 31, reset),
+        gunzip_loop(Z, zlib:safeInflate(Z, Compressed), MaxSize, <<>>)
+    after
+        zlib:close(Z)
+    end.
+
+%% @private
+decode_signed(Signed) ->
+    r3_hex_pb_signed:decode_msg(Signed, 'Signed').
+
+%% @private
+-spec decode_and_verify_signed(binary(), public_key()) -> {ok, binary()} | {error, term()}.
+decode_and_verify_signed(Signed, PublicKey) ->
+    #{payload := Payload, signature := Signature} = decode_signed(Signed),
+    case verify(Payload, Signature, PublicKey) of
+        true -> {ok, Payload};
+        false -> {error, bad_signature};
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% @private
+-spec sign(binary(), private_key()) -> binary().
+sign(Binary, PrivateKey) ->
+    {ok, RSAPrivateKey} = key(PrivateKey),
+    public_key:sign(Binary, sha512, RSAPrivateKey).
+
+%% @private
+-spec verify(binary(), binary(), public_key()) -> boolean() | {error, term()}.
+verify(Binary, Signature, PublicKey) ->
+    case key(PublicKey) of
+        {ok, RSAPublicKey} -> public_key:verify(Binary, sha512, Signature, RSAPublicKey);
+        {error, Reason} -> {error, Reason}
+    end.
+
+%%====================================================================
+%% Internal functions
+%%====================================================================
+
+%% @private
+gunzip_and_verify(Payload, PublicKey) ->
+    MaxSize = maps:get(registry_max_uncompressed_size, r3_hex_core:default_config()),
+    case gunzip(Payload, MaxSize) of
+        {ok, Signed} -> decode_and_verify_signed(Signed, PublicKey);
+        {error, _} = Error -> Error
+    end.
+
+%% @private
+%% Each output is appended to one binary, which the runtime grows in place,
+%% so memory use follows the output size however many gzip members the input
+%% has, and the binary is returned without another copy
+gunzip_loop(Z, {Status, Output}, MaxSize, Acc0) ->
+    Acc = gunzip_append(Output, Acc0),
+    case is_integer(MaxSize) andalso byte_size(Acc) > MaxSize of
+        true ->
+            {error, {too_big_uncompressed, MaxSize}};
+        false when Status =:= continue ->
+            gunzip_loop(Z, zlib:safeInflate(Z, []), MaxSize, Acc);
+        false when Status =:= finished ->
+            %% Raises data_error when the input ends before the gzip stream does
+            zlib:inflateEnd(Z),
+            {ok, Acc}
+    end.
+
+%% @private
+gunzip_append([], Acc) ->
+    Acc;
+gunzip_append([Output | Rest], Acc) ->
+    gunzip_append(Rest, gunzip_append(Output, Acc));
+gunzip_append(Output, Acc) when is_binary(Output) ->
+    <<Acc/binary, Output/binary>>.
+
+%% @private
+key(#'RSAPublicKey'{} = Key) ->
+    {ok, Key};
+key(#'RSAPrivateKey'{} = Key) ->
+    {ok, Key};
+key(Binary) when is_binary(Binary) ->
+    case public_key:pem_decode(Binary) of
+        [Entry | _] -> {ok, public_key:pem_entry_decode(Entry)};
+        _ -> {error, bad_key}
+    end.

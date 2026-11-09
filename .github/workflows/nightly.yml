@@ -5,24 +5,29 @@ on:
     branches:
       - 'main'
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Publish escript for every merge to main
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-
-    - uses: erlef/setup-beam@v1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-          otp-version: '22.3.4.9'
+        persist-credentials: false
+
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      with:
+          otp-version: '27'
     - name: Compile
       run: ./bootstrap
     - name: CT tests
       run: ./rebar3 ct
 
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

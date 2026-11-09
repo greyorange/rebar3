@@ -1,0 +1,647 @@
+%% Test suite for the rebar pkg index caching and decompression
+%% mechanisms.
+-module(rebar_pkg_SUITE).
+-compile(export_all).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include("rebar.hrl").
+
+-define(bad_etag, <<"abcdef">>).
+-define(good_etag, <<"22e1d7387c9085a462340088a2a8ba67">>).
+-define(badpkg_checksum, <<"A14E3718B33F8124E98004433193509EC6660F6CA03302657CAB8785751D77A0">>).
+-define(badindex_checksum, <<"7B2CBED315C89F3126B5BF553DD7FF0FB5FE94B064888DD1B095CE8BF4B6A16A">>).
+-define(bad_checksum, <<"D576B442A68C7B92BACDE1EFE9C6E54D8D6C74BDB71D8175B9D3C6EC8C7B62A7">>).
+-define(good_checksum, <<"ABA3B638A653A2414BF9DFAF76D90C937C53D1BE5B5D51A990C6FCC3A775C6F">>).
+-define(BADPKG_ETAG, <<"BADETAG">>).
+
+all() -> [good_uncached, good_cached, badpkg, badhash_nocache,
+          badindexchk, badhash_cache, bad_to_good, good_disconnect,
+          bad_disconnect, pkgs_provider, find_highest_matching,
+          parse_deps_ignores_optional,
+          oauth_download_with_token, oauth_download_token_refresh].
+
+init_per_suite(Config) ->
+    application:start(meck),
+    Config.
+
+end_per_suite(_Config) ->
+    application:stop(meck).
+
+init_per_testcase(pkgs_provider=Name, Config) ->
+    %% Need to mock out a registry for this test now because it will try to update it automatically
+    Priv = ?config(priv_dir, Config),
+    Tid = ets:new(registry_table, [public]),
+    ets:insert_new(Tid, []),
+    CacheRoot = filename:join([Priv, "cache", atom_to_list(Name)]),
+    CacheDir = filename:join([CacheRoot, "hex", "com", "test", "packages"]),
+    filelib:ensure_dir(filename:join([CacheDir, "registry"])),
+    ok = ets:tab2file(Tid, filename:join([CacheDir, "registry"])),
+    Config;
+init_per_testcase(good_uncached=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}}
+             | Config0],
+    mock_config(Name, Config);
+init_per_testcase(good_cached=Name, Config0) ->
+    Pkg = {<<"goodpkg">>, <<"1.0.0">>},
+    Config1 = [{good_cache, true},
+               {pkg, Pkg}
+              | Config0],
+    Config = mock_config(Name, Config1),
+    copy_to_cache(Pkg, Config),
+    Config;
+init_per_testcase(badindexchk=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"badindexchk">>, <<"1.0.0">>}}
+             | Config0],
+    mock_config(Name, Config);
+init_per_testcase(badpkg=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"badpkg">>, <<"1.0.0">>}}
+             | Config0],
+    mock_config(Name, Config);
+init_per_testcase(badhash_nocache=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}}
+             | Config0],
+    mock_config(Name, Config);
+init_per_testcase(badhash_cache=Name, Config0) ->
+    Pkg = {<<"goodpkg">>, <<"1.0.0">>},
+    Config1 = [{good_cache, true},
+               {pkg, Pkg}
+              | Config0],
+    Config = mock_config(Name, Config1),
+    copy_to_cache(Pkg, Config),
+    Config;
+init_per_testcase(bad_to_good=Name, Config0) ->
+    Config1 = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}}
+              | Config0],
+    Config = mock_config(Name, Config1),
+    Source = filename:join(?config(data_dir, Config), <<"badpkg-1.0.0.tar">>),
+    Dest = filename:join(?config(cache_dir, Config), <<"goodpkg-1.0.0.tar">>),
+    ec_file:copy(Source, Dest),
+    Config;
+init_per_testcase(good_disconnect=Name, Config0) ->
+    Pkg = {<<"goodpkg">>, <<"1.0.0">>},
+    Config1 = [{good_cache, false},
+               {pkg, Pkg}
+              | Config0],
+    Config = mock_config(Name, Config1),
+    copy_to_cache(Pkg, Config),
+    %% meck:unload(httpc),
+    meck:new(httpc, [passthrough, unsticky]),
+    meck:expect(httpc, request, fun(_, _, _, _) -> {error, econnrefused} end),
+    Config;
+init_per_testcase(bad_disconnect=Name, Config0) ->
+    Pkg = {<<"goodpkg">>, <<"1.0.0">>},
+    Config1 = [{good_cache, false},
+               {pkg, Pkg}
+              | Config0],
+    Config = mock_config(Name, Config1),
+    meck:expect(r3_hex_repo, get_tarball, fun(_, _, _) ->
+                                               {error, econnrefused}
+                                       end),
+    Config;
+init_per_testcase(oauth_download_with_token=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}},
+              {oauth_token, <<"test-oauth-token">>}
+              | Config0],
+    mock_config_oauth(Name, Config);
+init_per_testcase(oauth_download_token_refresh=Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}},
+              {oauth_token, <<"expired-token">>},
+              {oauth_refresh_token, <<"refresh-token">>},
+              {new_oauth_token, <<"new-access-token">>}
+              | Config0],
+    mock_config_oauth_refresh(Name, Config);
+init_per_testcase(Name, Config0) ->
+    Config = [{good_cache, false},
+              {pkg, {<<"goodpkg">>, <<"1.0.0">>}}
+              | Config0],
+    mock_config(Name, Config).
+
+end_per_testcase(_, Config) ->
+    unmock_config(Config),
+    Config.
+
+good_uncached(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    ?assert(meck:called(r3_hex_repo, get_tarball,
+                        [meck:is(fun(#{http_etag := T}) -> T =:= undefined end), '_', '_'])),
+    Cache = ?config(cache_dir, Config),
+    ?assert(filelib:is_regular(filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>))).
+
+good_cached(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    Cache = ?config(cache_dir, Config),
+    CachedFile = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>),
+    ?assert(filelib:is_regular(CachedFile)),
+    ETagPath = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".etag">>),
+    rebar_pkg_resource:store_etag_in_cache(ETagPath, ?good_etag),
+    {ok, Content} = file:read_file(CachedFile),
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    ?assert(meck:called(r3_hex_repo, get_tarball,
+                        [meck:is(fun(#{http_etag := T}) -> T =:= ?good_etag end), '_', '_'])),
+    {ok, Content} = file:read_file(CachedFile).
+
+
+badindexchk(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    ?assertMatch({error, {rebar_pkg_resource, {bad_registry_checksum, _, _, _, _}}},
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?bad_checksum, ?bad_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    %% The cached file is there for forensic purposes
+    Cache = ?config(cache_dir, Config),
+    ?assert(filelib:is_regular(filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>))).
+
+badpkg(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    Cache = ?config(cache_dir, Config),
+    CachePath = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>),
+    ETagPath = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".etag">>),
+    rebar_pkg_resource:store_etag_in_cache(ETagPath, ?BADPKG_ETAG),
+    ?assertMatch({error, {hex_tarball, {tarball, {inner_checksum_mismatch, _, _}}}},
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?badpkg_checksum, ?badpkg_checksum, ?config(repo_config, Config)}, State, #{}, false)),
+    %% The cached/etag files are there for forensic purposes
+    ?assert(filelib:is_regular(ETagPath)),
+    ?assert(filelib:is_regular(CachePath)).
+
+badhash_nocache(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    ?assertMatch({error, {rebar_pkg_resource, {bad_registry_checksum, _, _, _, _}}},
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?bad_checksum, ?bad_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    %% The cached file is there for forensic purposes
+    Cache = ?config(cache_dir, Config),
+    ?assert(filelib:is_regular(filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>))).
+
+badhash_cache(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    Cache = ?config(cache_dir, Config),
+    State = ?config(state, Config),
+    CachedFile = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>),
+    ?assert(filelib:is_regular(CachedFile)),
+    {ok, Content} = file:read_file(CachedFile),
+    ?assertMatch({error, {rebar_pkg_resource, {bad_registry_checksum, _, _, _, _}}},
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?bad_checksum, ?bad_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    %% The cached file is there still, unchanged.
+    ?assert(filelib:is_regular(CachedFile)),
+    ?assertEqual({ok, Content}, file:read_file(CachedFile)).
+
+bad_to_good(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    Cache = ?config(cache_dir, Config),
+    CachedFile = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>),
+    ?assert(filelib:is_regular(CachedFile)),
+    {ok, Contents} = file:read_file(CachedFile),
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    %% Cache has refreshed
+    ?assert({ok, Contents} =/= file:read_file(CachedFile)).
+
+good_disconnect(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    Cache = ?config(cache_dir, Config),
+    CachedFile = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>),
+    ETagFile = filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".etag">>),
+    ?assert(filelib:is_regular(CachedFile)),
+    {ok, Content} = file:read_file(CachedFile),
+    rebar_pkg_resource:store_etag_in_cache(ETagFile, ?BADPKG_ETAG),
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum, ?config(repo_config, Config)}, State, #{}, true)),
+    {ok, Content} = file:read_file(CachedFile).
+
+bad_disconnect(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    ?assertEqual({fetch_fail, Pkg, Vsn},
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum, ?config(repo_config, Config)}, State, #{}, true)).
+
+pkgs_provider(Config) ->
+    Config1 = rebar_test_utils:init_rebar_state(Config),
+    rebar_test_utils:run_and_check(
+      Config1, [], ["pkgs", "relx"],
+        {ok, []}
+    ).
+
+find_highest_matching(_Config) ->
+    State = rebar_state:new(),
+    {ok, Vsn} = rebar_packages:find_highest_matching_(
+                  <<"goodpkg">>, <<"1.0.0">>, #{name => <<"hexpm">>}, ?PACKAGE_TABLE, State),
+    ?assertEqual({{1,0,1},{[],[]}}, Vsn),
+    {ok, Vsn1} = rebar_packages:find_highest_matching(
+                   <<"goodpkg">>, <<"1.0">>, #{name => <<"hexpm">>}, ?PACKAGE_TABLE, State),
+    ?assertEqual({{1,1,1},{[],[]}}, Vsn1),
+    {ok, Vsn2} = rebar_packages:find_highest_matching(
+                   <<"goodpkg">>, <<"2.0">>, #{name => <<"hexpm">>}, ?PACKAGE_TABLE, State),
+    ?assertEqual({{2,0,0},{[],[]}}, Vsn2),
+
+    %% regression test. ~> constraints higher than the available packages would result
+    %% in returning the first package version instead of 'none'.
+    ?assertEqual(none, rebar_packages:find_highest_matching_(<<"goodpkg">>, <<"5.0">>,
+                                                             #{name => <<"hexpm">>}, ?PACKAGE_TABLE, State)),
+
+
+    {ok, Vsn3} = rebar_packages:find_highest_matching_(<<"goodpkg">>, <<"3.0.0-rc.0">>,
+                                                       #{name => <<"hexpm">>}, ?PACKAGE_TABLE, State),
+    ?assertEqual({{3,0,0},{[<<"rc">>,0],[]}}, Vsn3).
+
+parse_deps_ignores_optional(_Config) ->
+    %% Test that optional dependencies are filtered out
+    Deps = [
+        #{package => <<"req">>, requirement => <<"~> 1.0">>},
+        #{package => <<"opt">>, requirement => <<"~> 2.0">>, optional => true},
+        #{package => <<"exp">>, requirement => <<"~> 3.0">>, optional => false},
+        #{package => <<"ali">>, requirement => <<"4.0">>, app => <<"alias">>},
+        #{package => <<"ali_opt">>, requirement => <<"~> 5.0">>,
+          app => <<"alias2">>, optional => true}
+    ],
+    Result = rebar_packages:parse_deps(Deps),
+    ?assertEqual(3, length(Result)),
+    ?assertMatch([{<<"req">>, {pkg, <<"req">>, <<"~> 1.0">>, _, _}},
+                  {<<"exp">>, {pkg, <<"exp">>, <<"~> 3.0">>, _, _}},
+                  {<<"alias">>, {pkg, <<"ali">>, <<"4.0">>, _, _}}],
+                 Result).
+
+%% Test that OAuth token is properly sent as Bearer token in requests
+oauth_download_with_token(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg, Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    OAuthToken = ?config(oauth_token, Config),
+    ExpectedBearer = <<"Bearer ", OAuthToken/binary>>,
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum,
+                                                   ?config(repo_config, Config)},
+                                             State, #{}, true)),
+    %% Verify that the Bearer token was sent
+    ?assert(meck:called(r3_hex_repo, get_tarball,
+                        [meck:is(fun(#{repo_key := Key}) -> Key =:= ExpectedBearer end), '_', '_'])),
+    Cache = ?config(cache_dir, Config),
+    ?assert(filelib:is_regular(filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>))).
+
+%% Test that OAuth token is refreshed on 401 and request is retried
+oauth_download_token_refresh(Config) ->
+    Tmp = ?config(tmp_dir, Config),
+    {Pkg, Vsn} = ?config(pkg, Config),
+    State = ?config(state, Config),
+    _OldToken = ?config(oauth_token, Config),
+    _RefreshToken = ?config(oauth_refresh_token, Config),
+    NewToken = ?config(new_oauth_token, Config),
+    NewBearer = <<"Bearer ", NewToken/binary>>,
+    ?assertEqual(ok,
+                 rebar_pkg_resource:download(Tmp, {pkg, Pkg, Vsn, ?good_checksum, ?good_checksum,
+                                                   ?config(repo_config, Config)},
+                                             State, #{}, true)),
+    %% Verify that refresh was called
+    ?assert(meck:called(r3_hex_api_oauth, refresh_token, '_')),
+    %% Verify that the new Bearer token was used for retry
+    ?assert(meck:called(r3_hex_repo, get_tarball,
+                        [meck:is(fun(#{repo_key := Key}) -> Key =:= NewBearer end), '_', '_'])),
+    Cache = ?config(cache_dir, Config),
+    ?assert(filelib:is_regular(filename:join(Cache, <<Pkg/binary, "-", Vsn/binary, ".tar">>))).
+
+%%%%%%%%%%%%%%%
+%%% Helpers %%%
+%%%%%%%%%%%%%%%
+mock_config(Name, Config) ->
+    Priv = ?config(priv_dir, Config),
+    CacheRoot = filename:join([Priv, "cache", atom_to_list(Name)]),
+    TmpDir = filename:join([Priv, "tmp", atom_to_list(Name)]),
+    Tid = ets:new(registry_table, [public]),
+    AllDeps = [
+        {{<<"badindexchk">>,<<"1.0.0">>}, [[], ?bad_checksum, ?bad_checksum, [<<"rebar3">>]]},
+        {{<<"goodpkg">>,<<"1.0.0">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]},
+        {{<<"goodpkg">>,<<"1.0.1">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]},
+        {{<<"goodpkg">>,<<"1.1.1">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]},
+        {{<<"goodpkg">>,<<"2.0.0">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]},
+        {{<<"goodpkg">>,<<"3.0.0-rc.0">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]},
+        {{<<"badpkg">>,<<"1.0.0">>}, [[], ?badpkg_checksum, ?badpkg_checksum, [<<"rebar3">>]]}
+    ],
+    ets:insert_new(Tid, AllDeps),
+    CacheDir = filename:join([CacheRoot, "hex", "com", "test", "packages"]),
+    filelib:ensure_dir(filename:join([CacheDir, "registry"])),
+    ok = ets:tab2file(Tid, filename:join([CacheDir, "registry"])),
+
+    catch ets:delete(?PACKAGE_TABLE),
+    rebar_packages:new_package_table(),
+    lists:foreach(fun({{N, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]}) ->
+                          case ets:member(?PACKAGE_TABLE, {ec_cnv:to_binary(N), Vsn, <<"hexpm">>}) of
+                              false ->
+                                  {ok, Parsed} = rebar_semver:parse_version(Vsn),
+                                  ets:insert(?PACKAGE_TABLE, #package{key={ec_cnv:to_binary(N), Parsed, <<"hexpm">>},
+                                                                      dependencies=Deps,
+                                                                      retired=false,
+                                                                      inner_checksum=InnerChecksum,
+                                                                      outer_checksum=OuterChecksum});
+                              true ->
+                                  ok
+                          end
+                  end, AllDeps),
+
+
+    meck:new(r3_hex_repo, [passthrough]),
+    meck:expect(r3_hex_repo, get_package,
+                fun(_Config, PkgName) ->
+                        Matches = ets:match_object(Tid, {{PkgName,'_'}, '_'}),
+                        Releases =
+                            [#{outer_checksum => OuterChecksum,
+                               inner_checksum => InnerChecksum,
+                               version => Vsn,
+                               dependencies => Deps} ||
+                                {{_, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]} <- Matches],
+                        {ok, {200, #{}, Releases}}
+                end),
+
+    %% The state returns us a fake registry
+    meck:new(rebar_state, [passthrough]),
+    meck:expect(rebar_state, get,
+                fun(_State, rebar_packages_cdn, _Default) ->
+                        "http://test.com/";
+                   (_, _, Default) ->
+                        Default
+                end),
+    Callbacks = rebar_hex_auth:make_callbacks(rebar_state:new()),
+    DefaultConfig = r3_hex_core:default_config(),
+    RepoConfig = DefaultConfig#{name => <<"hexpm">>, cli_auth_callbacks => Callbacks},
+
+    meck:new(rebar_dir, [passthrough]),
+    meck:expect(rebar_dir, global_cache_dir, fun(_) -> CacheRoot end),
+    meck:expect(rebar_dir, global_config_dir, fun(_) -> CacheRoot end),
+    meck:expect(rebar_state, resources,
+                fun(_State) ->
+                        [rebar_resource_v2:new(pkg, rebar_pkg_resource,
+                                               #{repos => [RepoConfig],
+                                                 base_config => #{}})]
+                end),
+
+    meck:expect(rebar_packages, registry_dir, fun(_) -> {ok, CacheDir} end),
+    meck:expect(rebar_packages, package_dir, fun(_, _) -> {ok, CacheDir} end),
+
+    meck:new(rebar_prv_update, [passthrough]),
+    meck:expect(rebar_prv_update, do, fun(State) -> {ok, State} end),
+
+    %% Cache fetches are mocked -- we assume the server and clients are
+    %% correctly used.
+    GoodCache = ?config(good_cache, Config),
+    {Pkg,Vsn} = ?config(pkg, Config),
+    PkgFile = <<Pkg/binary, "-", Vsn/binary, ".tar">>,
+    {ok, PkgContents} = file:read_file(filename:join(?config(data_dir, Config), PkgFile)),
+
+    meck:expect(r3_hex_repo, get_tarball, fun(_, _, _) when GoodCache ->
+                                               {ok, {304, #{<<"etag">> => ?good_etag}, <<>>}};
+                                          (_, _, _) ->
+                                               {ok, {200, #{<<"etag">> => ?good_etag}, PkgContents}}
+                                       end),
+
+    [{cache_root, CacheRoot},
+     {cache_dir, CacheDir},
+     {tmp_dir, TmpDir},
+     {mock_table, Tid},
+     {repo_config, RepoConfig},
+     {state, rebar_state:new()} | Config].
+
+unmock_config(Config) ->
+    meck:unload(),
+    catch ets:delete(?config(mock_table, Config)).
+
+copy_to_cache({Pkg,Vsn}, Config) ->
+    Name = <<Pkg/binary, "-", Vsn/binary, ".tar">>,
+    Source = filename:join(?config(data_dir, Config), Name),
+    Dest = filename:join(?config(cache_dir, Config), Name),
+    ec_file:copy(Source, Dest).
+
+%% Mock config for OAuth tests - similar to mock_config but includes OAuth token handling
+mock_config_oauth(Name, Config) ->
+    Priv = ?config(priv_dir, Config),
+    CacheRoot = filename:join([Priv, "cache", atom_to_list(Name)]),
+    TmpDir = filename:join([Priv, "tmp", atom_to_list(Name)]),
+    Tid = ets:new(registry_table, [public]),
+    AllDeps = [
+        {{<<"goodpkg">>,<<"1.0.0">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]}
+    ],
+    ets:insert_new(Tid, AllDeps),
+    CacheDir = filename:join([CacheRoot, "hex", "com", "test", "packages"]),
+    filelib:ensure_dir(filename:join([CacheDir, "registry"])),
+    ok = ets:tab2file(Tid, filename:join([CacheDir, "registry"])),
+
+    catch ets:delete(?PACKAGE_TABLE),
+    rebar_packages:new_package_table(),
+    lists:foreach(fun({{N, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]}) ->
+                          {ok, Parsed} = rebar_semver:parse_version(Vsn),
+                          ets:insert(?PACKAGE_TABLE, #package{key={ec_cnv:to_binary(N), Parsed, <<"hexpm">>},
+                                                              dependencies=Deps,
+                                                              retired=false,
+                                                              inner_checksum=InnerChecksum,
+                                                              outer_checksum=OuterChecksum})
+                  end, AllDeps),
+
+    meck:new(r3_hex_repo, [passthrough]),
+    meck:expect(r3_hex_repo, get_package,
+                fun(_Config, PkgName) ->
+                        Matches = ets:match_object(Tid, {{PkgName,'_'}, '_'}),
+                        Releases =
+                            [#{outer_checksum => OuterChecksum,
+                               inner_checksum => InnerChecksum,
+                               version => Vsn,
+                               dependencies => Deps} ||
+                                {{_, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]} <- Matches],
+                        {ok, {200, #{}, Releases}}
+                end),
+
+    meck:new(rebar_state, [passthrough]),
+    meck:expect(rebar_state, get,
+                fun(_State, rebar_packages_cdn, _Default) ->
+                        "http://test.com/";
+                   (_, _, Default) ->
+                        Default
+                end),
+
+    %% Write auth config file with OAuth token
+    OAuthToken = ?config(oauth_token, Config),
+    AuthConfigDir = filename:join([CacheRoot, "config"]),
+    AuthConfigFile = filename:join(AuthConfigDir, "hex.config"),
+    filelib:ensure_dir(AuthConfigFile),
+    AuthConfig = #{<<"$oauth">> => #{
+        access_token => OAuthToken,
+        expires_at => erlang:system_time(second) + 3600
+    }},
+    ok = file:write_file(AuthConfigFile, io_lib:format("~p.~n", [AuthConfig])),
+
+    Callbacks = rebar_hex_auth:make_callbacks(rebar_state:new()),
+    DefaultConfig = r3_hex_core:default_config(),
+    RepoConfig = DefaultConfig#{name => <<"hexpm">>, trusted => true, cli_auth_callbacks => Callbacks},
+
+    meck:new(rebar_dir, [passthrough]),
+    meck:expect(rebar_dir, global_cache_dir, fun(_) -> CacheRoot end),
+    meck:expect(rebar_dir, global_config_dir, fun(_) -> AuthConfigDir end),
+
+    meck:expect(rebar_state, resources,
+                fun(_State) ->
+                        [rebar_resource_v2:new(pkg, rebar_pkg_resource,
+                                               #{repos => [RepoConfig],
+                                                 base_config => #{}})]
+                end),
+
+    meck:new(rebar_prv_update, [passthrough]),
+    meck:expect(rebar_prv_update, do, fun(State) -> {ok, State} end),
+
+    meck:expect(rebar_packages, registry_dir, fun(_) -> {ok, CacheDir} end),
+    meck:expect(rebar_packages, package_dir, fun(_, _) -> {ok, CacheDir} end),
+
+    {Pkg, Vsn} = ?config(pkg, Config),
+    PkgFile = <<Pkg/binary, "-", Vsn/binary, ".tar">>,
+    {ok, PkgContents} = file:read_file(filename:join(?config(data_dir, Config), PkgFile)),
+
+    %% For OAuth test: verify Bearer token is passed and return success
+    meck:expect(r3_hex_repo, get_tarball,
+                fun(#{repo_key := <<"Bearer ", _/binary>>}, _, _) ->
+                        {ok, {200, #{<<"etag">> => ?good_etag}, PkgContents}};
+                   (_, _, _) ->
+                        {ok, {401, #{}, #{<<"message">> => <<"Unauthorized">>}}}
+                end),
+
+    [{cache_root, CacheRoot},
+     {cache_dir, CacheDir},
+     {tmp_dir, TmpDir},
+     {mock_table, Tid},
+     {repo_config, RepoConfig},
+     {state, rebar_state:new()} | Config].
+
+%% Mock config for OAuth refresh tests - returns 401 first, then success after refresh
+mock_config_oauth_refresh(Name, Config) ->
+    Priv = ?config(priv_dir, Config),
+    CacheRoot = filename:join([Priv, "cache", atom_to_list(Name)]),
+    TmpDir = filename:join([Priv, "tmp", atom_to_list(Name)]),
+    Tid = ets:new(registry_table, [public]),
+    AllDeps = [
+        {{<<"goodpkg">>,<<"1.0.0">>}, [[], ?good_checksum, ?good_checksum, [<<"rebar3">>]]}
+    ],
+    ets:insert_new(Tid, AllDeps),
+    CacheDir = filename:join([CacheRoot, "hex", "com", "test", "packages"]),
+    filelib:ensure_dir(filename:join([CacheDir, "registry"])),
+    ok = ets:tab2file(Tid, filename:join([CacheDir, "registry"])),
+
+    catch ets:delete(?PACKAGE_TABLE),
+    rebar_packages:new_package_table(),
+    lists:foreach(fun({{N, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]}) ->
+                          {ok, Parsed} = rebar_semver:parse_version(Vsn),
+                          ets:insert(?PACKAGE_TABLE, #package{key={ec_cnv:to_binary(N), Parsed, <<"hexpm">>},
+                                                              dependencies=Deps,
+                                                              retired=false,
+                                                              inner_checksum=InnerChecksum,
+                                                              outer_checksum=OuterChecksum})
+                  end, AllDeps),
+
+    meck:new(r3_hex_repo, [passthrough]),
+    meck:expect(r3_hex_repo, get_package,
+                fun(_Config, PkgName) ->
+                        Matches = ets:match_object(Tid, {{PkgName,'_'}, '_'}),
+                        Releases =
+                            [#{outer_checksum => OuterChecksum,
+                               inner_checksum => InnerChecksum,
+                               version => Vsn,
+                               dependencies => Deps} ||
+                                {{_, Vsn}, [Deps, InnerChecksum, OuterChecksum, _]} <- Matches],
+                        {ok, {200, #{}, Releases}}
+                end),
+
+    meck:new(rebar_state, [passthrough]),
+    meck:expect(rebar_state, get,
+                fun(_State, rebar_packages_cdn, _Default) ->
+                        "http://test.com/";
+                   (_, _, Default) ->
+                        Default
+                end),
+
+    OldToken = ?config(oauth_token, Config),
+    RefreshToken = ?config(oauth_refresh_token, Config),
+    NewToken = ?config(new_oauth_token, Config),
+    OldBearer = <<"Bearer ", OldToken/binary>>,
+    NewBearer = <<"Bearer ", NewToken/binary>>,
+
+    %% Write auth config file with expired OAuth token and refresh token
+    AuthConfigDir = filename:join([CacheRoot, "config"]),
+    AuthConfigFile = filename:join(AuthConfigDir, "hex.config"),
+    filelib:ensure_dir(AuthConfigFile),
+    AuthConfig = #{<<"$oauth">> => #{
+        access_token => OldToken,
+        refresh_token => RefreshToken,
+        expires_at => erlang:system_time(second) - 100  %% Expired
+    }},
+    ok = file:write_file(AuthConfigFile, io_lib:format("~p.~n", [AuthConfig])),
+
+    Callbacks = rebar_hex_auth:make_callbacks(rebar_state:new()),
+    DefaultConfig = r3_hex_core:default_config(),
+    RepoConfig = DefaultConfig#{name => <<"hexpm">>, trusted => true, cli_auth_callbacks => Callbacks},
+
+    meck:new(rebar_dir, [passthrough]),
+    meck:expect(rebar_dir, global_cache_dir, fun(_) -> CacheRoot end),
+    meck:expect(rebar_dir, global_config_dir, fun(_) -> AuthConfigDir end),
+
+    meck:expect(rebar_state, resources,
+                fun(_State) ->
+                        [rebar_resource_v2:new(pkg, rebar_pkg_resource,
+                                               #{repos => [RepoConfig],
+                                                 base_config => #{}})]
+                end),
+
+    meck:new(rebar_prv_update, [passthrough]),
+    meck:expect(rebar_prv_update, do, fun(State) -> {ok, State} end),
+
+    meck:expect(rebar_packages, registry_dir, fun(_) -> {ok, CacheDir} end),
+    meck:expect(rebar_packages, package_dir, fun(_, _) -> {ok, CacheDir} end),
+
+    {Pkg, Vsn} = ?config(pkg, Config),
+    PkgFile = <<Pkg/binary, "-", Vsn/binary, ".tar">>,
+    {ok, PkgContents} = file:read_file(filename:join(?config(data_dir, Config), PkgFile)),
+
+    %% Mock update_repo_auth_config to track calls but not actually write
+    meck:new(rebar_hex_repos, [passthrough]),
+    meck:expect(rebar_hex_repos, update_repo_auth_config, fun(_Updates, _RepoName, _State) -> ok end),
+
+    %% Return 401 for old token, 200 for new token
+    meck:expect(r3_hex_repo, get_tarball,
+                fun(#{repo_key := Key}, _, _) when Key =:= OldBearer ->
+                        {ok, {401, #{}, #{<<"message">> => <<"Unauthorized">>}}};
+                   (#{repo_key := Key}, _, _) when Key =:= NewBearer ->
+                        {ok, {200, #{<<"etag">> => ?good_etag}, PkgContents}};
+                   (_, _, _) ->
+                        {ok, {401, #{}, #{<<"message">> => <<"Unauthorized">>}}}
+                end),
+
+    %% Mock OAuth refresh
+    meck:new(r3_hex_api_oauth, [passthrough]),
+    meck:expect(r3_hex_api_oauth, refresh_token,
+                fun(_Config, _ClientId, _RefreshToken) ->
+                        {ok, {200, #{}, #{<<"access_token">> => NewToken,
+                                          <<"refresh_token">> => <<"new-refresh-token">>,
+                                          <<"expires_in">> => 3600}}}
+                end),
+
+    [{cache_root, CacheRoot},
+     {cache_dir, CacheDir},
+     {tmp_dir, TmpDir},
+     {mock_table, Tid},
+     {repo_config, RepoConfig},
+     {state, rebar_state:new()} | Config].
